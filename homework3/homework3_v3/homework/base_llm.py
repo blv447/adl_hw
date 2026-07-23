@@ -105,7 +105,53 @@ class BaseLLM:
                 for r in self.batched_generate(prompts[idx : idx + micro_batch_size], num_return_sequences, temperature)
             ]
 
-        raise NotImplementedError()
+        # Left-pad so all prompts align on the right (generation start point)
+        self.tokenizer.padding_side = "left"
+
+        # Fallback pad token if none is set
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Tokenize whole batch at once
+        inputs = self.tokenizer(prompts, padding=True, return_tensors="pt").to(self.device)
+
+        # temperature > 0 -> sample, else greedy decode
+        do_sample = temperature > 0
+
+        generate_kwargs = dict(
+            max_new_tokens=75,
+            do_sample=do_sample,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        if do_sample:
+            generate_kwargs["temperature"] = temperature
+        if num_return_sequences is not None:
+            generate_kwargs["num_return_sequences"] = num_return_sequences
+
+        # Generate (inference only, no grad needed)
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                **generate_kwargs,
+            )
+
+        # Strip prompt tokens, keep only newly generated ones
+        input_len = inputs["input_ids"].shape[1]
+        generated_tokens = outputs[:, input_len:]
+
+        # Flat list: len(prompts) * num_return_sequences (or just len(prompts))
+        decoded = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+
+        # Reshape into one sub-list per prompt if multiple sequences requested
+        if num_return_sequences is not None:
+            return [
+                decoded[i * num_return_sequences : (i + 1) * num_return_sequences]
+                for i in range(len(prompts))
+            ]
+
+        return decoded
 
     def answer(self, *questions) -> list[float]:
         """
