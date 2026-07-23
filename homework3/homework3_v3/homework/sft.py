@@ -45,11 +45,17 @@ def tokenize(tokenizer, question: str, answer: str):
     return full
 
 
-def format_example(prompt: str, answer: str) -> dict[str, str]:
+def format_example(prompt: str, answer: float) -> dict[str, str]:
     """
     Construct a question / answer pair. Consider rounding the answer to make it easier for the LLM.
     """
-    raise NotImplementedError()
+    # No chat template here - just raw question text followed by the answer tag,
+    # matching how BaseLLM.format_prompt (unmodified) presents the question at inference time.
+    # Round the answer to keep the target string short/simple for the model to learn.
+    return {
+        "question": prompt,
+        "answer": f"<answer>{round(answer, 4)}</answer>",
+    }
 
 
 class TokenizedDataset:
@@ -78,7 +84,52 @@ def train_model(
     output_dir: str,
     **kwargs,
 ):
-    raise NotImplementedError()
+    from peft import LoraConfig, get_peft_model
+    from transformers import Trainer, TrainingArguments
+
+    llm = BaseLLM()
+
+    # Wrap the base model with a LoRA adapter. target_modules="all-linear" adds an
+    # adapter to every linear layer. r is kept small so the final adapter stays well
+    # under the 20MB size limit; lora_alpha is set to ~4x r as recommended.
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=32,
+        target_modules="all-linear",
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    llm.model = get_peft_model(llm.model, lora_config)
+
+    # Required when combining PEFT with gradient_checkpointing=True below, otherwise
+    # gradients don't flow back through the frozen base model layers correctly.
+    llm.model.enable_input_require_grads()
+
+    # Build the tokenized training dataset from the question/answer pairs.
+    train_data = Dataset("train")
+    tokenized_dataset = TokenizedDataset(llm.tokenizer, train_data, format_example)
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        logging_dir=output_dir,
+        report_to="tensorboard",
+        gradient_checkpointing=True,
+        learning_rate=2e-4,
+        num_train_epochs=5,
+        per_device_train_batch_size=32,
+        save_strategy="no",  # avoid bulky intermediate checkpoint-N/ folders; we
+                             # explicitly save just the final adapter below instead
+    )
+
+    trainer = Trainer(
+        model=llm.model,
+        args=training_args,
+        train_dataset=tokenized_dataset,
+    )
+    trainer.train()
+
+    # Save just the LoRA adapter (small) rather than the full base model.
+    trainer.save_model(output_dir)
     test_model(output_dir)
 
 
