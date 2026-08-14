@@ -1,0 +1,9 @@
+homework4/data/
+homework4/homework/vlm_model/
+homework4/homework/vlm_sft/
+homework4/homework/demo_train/
+homework4/homework/__pycache__/
+**/__pycache__/
+*.pyc
+*.zip
+*.safetensors
