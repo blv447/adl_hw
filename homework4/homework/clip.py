@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Any
 
@@ -101,14 +102,43 @@ class CLIP(nn.Module):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
 
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.vision_encoder(image)
+        vision_hidden_size = vision_encoder.config.hidden_size
+        text_hidden_size = text_encoder.config.hidden_size
 
-    def encode_text(self, text: str) -> torch.Tensor:
-        return self.text_encoder(text)
+        # Linear projection heads mapping each backbone's pooled features into a shared
+        # embedding space of size proj_dim, where image/text similarity is computed.
+        self.vision_projection = nn.Linear(vision_hidden_size, proj_dim, bias=False)
+        self.text_projection = nn.Linear(text_hidden_size, proj_dim, bias=False)
+
+        # Learnable temperature, log-parameterized (standard CLIP trick) so it stays positive
+        # and training is well-behaved; exponentiated at use time.
+        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / temperature))
+
+    def _pool_image_features(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Mean-pool the vision transformer's per-patch hidden states into one vector per image."""
+        return hidden_states.mean(dim=1)
+
+    def _pool_text_features(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Mean-pool the text model's per-token hidden states over only the non-padding tokens."""
+        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
+        summed = (hidden_states * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-6)
+        return summed / counts
+
+    def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        outputs = self.vision_encoder(pixel_values=pixel_values)
+        pooled = self._pool_image_features(outputs.last_hidden_state)
+        projected = self.vision_projection(pooled)
+        return projected / projected.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = self._pool_text_features(outputs.last_hidden_state, attention_mask)
+        projected = self.text_projection(pooled)
+        return projected / projected.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """Customize save method, save additional parameters"""
@@ -178,9 +208,15 @@ class CLIP(nn.Module):
             (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
             (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
         Returns:
-            TODO: think about the what values should be returned
+            A tuple (image_embeds, text_embeds, logit_scale):
+            - image_embeds: L2-normalized projected image features, shape (batch, proj_dim)
+            - text_embeds: L2-normalized projected text features, shape (batch, proj_dim)
+            - logit_scale: scalar temperature (already exponentiated) used to scale similarities
         """
-        raise NotImplementedError("Not implemented")
+        image_embeds = self.encode_image(pixel_values)
+        text_embeds = self.encode_text(input_ids, attention_mask)
+        logit_scale = self.logit_scale.exp()
+        return image_embeds, text_embeds, logit_scale
 
 
 def compute_clip_loss(
@@ -199,7 +235,23 @@ def compute_clip_loss(
     Returns:
         The loss for the CLIP model.
     """
-    raise NotImplementedError("Not implemented")
+    image_embeds, text_embeds, logit_scale = outputs
+
+    # Cosine-similarity matrix between every image and every text in the batch, scaled by
+    # the learned temperature. Since features are already L2-normalized, the dot product
+    # is exactly the cosine similarity.
+    logits_per_image = logit_scale * image_embeds @ text_embeds.t()
+    logits_per_text = logits_per_image.t()
+
+    # The correct match for row i is column i (the image/caption pair was constructed that
+    # way in the batch), so the "labels" for this classification-style loss are just 0..B-1.
+    batch_size = image_embeds.shape[0]
+    targets = torch.arange(batch_size, device=image_embeds.device)
+
+    loss_image_to_text = nn.functional.cross_entropy(logits_per_image, targets)
+    loss_text_to_image = nn.functional.cross_entropy(logits_per_text, targets)
+
+    return (loss_image_to_text + loss_text_to_image) / 2
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
